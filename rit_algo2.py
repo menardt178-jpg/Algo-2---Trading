@@ -1,40 +1,35 @@
 # -*- coding: utf-8 -*-
 """
-RIT ALGO2 - Algorithmic Market Making - OPTIMIZED FOR THE REAL CASE
-===================================================================
-Tuned to the ALGO2 Case Brief (Rotman, Build 1.00). Pure requests + stdlib,
-runs directly in Spyder 6.
+RIT ALGO2 - Algorithmic Market Making - OPTIMIZED (v2, fill-aware)
+=================================================================
+Tuned to the ALGO2 Case Brief (Rotman, Build 1.00) AND to the observed
+leaderboard from a real run. Pure requests + stdlib, runs in Spyder 6.
 
-CASE FACTS (baked into the config below):
-  * one stock: ALGO,  tick size $0.01,  heat = 300 seconds
-  * 5,000 shares MAX per order
-  * 25,000 shares gross/net position limit
-  * MARKET orders (active) cost 1 cent/share commission
-  * LIMIT orders (passive) that fill EARN a 1/2 cent/share REBATE
-  * FINE of 10 cents/share for EXCEEDING the 25,000 limit  <-- never touch this
+CASE FACTS
+  ALGO, $0.01 tick, 300s heat, 5,000 shares/order, 25,000 gross/net limit,
+  1c/share commission on MARKET orders (active), 0.5c/share REBATE on LIMIT
+  fills (passive), 10c/share FINE for exceeding 25,000.
 
-WHY THIS BEATS THE TEACHER'S BASE CODE
-  The base algo (case solution) rests one bid at LAST-Spread and one ask at
-  LAST+Spread and just keeps 2 orders alive. Every student runs the same thing,
-  so they all sit at the same stale levels. The edges here:
-    1. REBATE-FIRST: quote passively on BOTH sides every cycle so you harvest
-       the 1/2c rebate on every fill. Two passive fills = +1c/share BEFORE any
-       spread. We NEVER send market orders except the final safety flatten,
-       because a market order turns that +1c into -1c.
-    2. QUEUE JUMP: rest one tick INSIDE the crowd (still passive, still earns
-       the rebate) so your order fills before the students quoting at the top of
-       book. This is the "front-run" -- pure priority, no crossing.
-    3. INVENTORY SKEW + WIND-DOWN: lean quotes against your position and, in the
-       last seconds, only quote the side that REDUCES inventory, so you never
-       ride a trend into the 25,000 fine and you finish near flat.
-    4. SPEED: a Python REST loop reprices far faster than an Excel F9 / RTD loop.
+WHAT THE LEADERBOARD TAUGHT US
+  * The winners did 1.3-1.7M shares of volume; ~2/3 of their profit was REBATES,
+    not spread. => harvest passive fills, quote tight, stay at the top of book.
+  * The best loser-by-effort (Cassy: 2.2M volume, only $742) paid huge
+    commissions => NEVER take liquidity. Passive limit orders only.
+  * The market was ultra-calm (a ~5c range all heat). => you must keep quoting
+    even when the price is frozen, or you go idle.
 
-TARGET: ~$10k in 300s. That needs volume: capture ~a few cents + 1c rebate per
-round trip on ~5,000 shares (~$150-250/round trip) about 40-60 times. Achievable
-in an active, range-bound market; hard if it trends (see MEAN_REVERT_WEIGHT).
+THE KEY FIX vs v1 ("stops trading after ~100s")
+  v1 only reposted when FAIR VALUE MOVED. In a calm market fair stops moving, so
+  after your orders filled they were never replaced and the bot went idle. v2 is
+  FILL-AWARE: it counts its own open orders every loop and reposts the instant a
+  fill is detected (open count < what we placed), independent of price movement,
+  plus a 1s heartbeat. This keeps you trading through the calm second half.
+
+EDGES: rebate-first passive quoting, queue jump (rest 1 tick inside the crowd),
+inventory skew, hard 23,000 safety cap, wind-down + flatten.
 """
 
-from time import sleep
+from time import sleep, monotonic
 import requests
 
 # ============================== CONFIG ====================================
@@ -45,34 +40,36 @@ TICKER = "ALGO"
 TICK_SIZE = 0.01
 
 # ---- SIZE (case: 5,000/order, 25,000 position limit) ----
-ORDER_SIZE = 5000              # per layer; case max per order is 5,000
-NUM_LAYERS = 2                 # layers per side
-MAX_POSITION = 25000           # HARD case limit
-POSITION_BUFFER = 2000         # stay this far under the limit -> effective 23,000
-                               # (avoids the 10c/share fine on fill-timing races)
+ORDER_SIZE = 5000
+NUM_LAYERS = 2
+MAX_POSITION = 25000
+POSITION_BUFFER = 2000                 # effective limit 23,000 -> avoids the fine
 
-# ---- Quoting ----
-BASE_HALF_SPREAD = 2           # ticks each side of fair value
-VOL_WIDEN = 1.5               # extra half-spread ticks per 1 std of recent vol
-VOL_PER_TICK = 0.02            # typical 1-tick move (tune from the Excel data)
-MAX_HALF_SPREAD = 8
-QUEUE_JUMP = True              # rest one tick inside the crowd (stays passive)
+# ---- Quoting (tight, to maximize fills & rebates in a calm market) ----
+BASE_HALF_SPREAD = 1                    # ticks each side; 1 = quote tight
+VOL_WIDEN = 1.5                        # widen only when volatility actually spikes
+VOL_PER_TICK = 0.01                    # ALGO is calm; measured ~1 tick moves
+MAX_HALF_SPREAD = 6
+QUEUE_JUMP = True
 
-# ---- Mean-reversion edge (buy dips / sell rips) ----
-MEAN_REVERT_WEIGHT = 0.25      # 0..1; SET TO 0 IF THE MARKET TRENDS
+# ---- Mean-reversion (weak here; price is pinned) ----
+MEAN_REVERT_WEIGHT = 0.20              # SET TO 0 IF A PATH TRENDS
 MEAN_LOOKBACK = 30
 
-# ---- Inventory management / timing (300s heat) ----
-INVENTORY_SKEW = 0.5           # 0..1 lean quotes against your position
-WIND_DOWN_AT_SEC_LEFT = 30     # last 30s: only quote the inventory-reducing side
-FLATTEN_AT_SEC_LEFT = 8        # last 8s: market-flatten any residual (accept 1c)
+# ---- Inventory / timing (300s heat) ----
+INVENTORY_SKEW = 0.5
+WIND_DOWN_AT_SEC_LEFT = 25
+FLATTEN_AT_SEC_LEFT = 6
 
-# ---- Loop / P&L ----
-REPRICE_THRESHOLD_TICKS = 1
-LOOP_PACING = 0.08
+# ---- Repost logic (the fix) ----
+REPRICE_THRESHOLD_TICKS = 1            # reprice when fair moves this much
+REFRESH_MAX_SEC = 1.0                  # heartbeat: repost at least this often
+LOOP_PACING = 0.06                     # poll fast to react to fills quickly
+
+# ---- Misc ----
 VOL_LOOKBACK = 20
 PROFIT_TARGET = 10000
-PNL_PRINT_EVERY = 25
+PNL_PRINT_EVERY = 30
 # ==========================================================================
 
 EFFECTIVE_LIMIT = MAX_POSITION - POSITION_BUFFER
@@ -97,15 +94,22 @@ def get_security(session):
     raise ApiException("Cannot read /securities for %s (HTTP %s)." % (TICKER, resp.status_code))
 
 
+def get_open_order_count(session):
+    resp = session.get(HOST + "/orders", params={"status": "OPEN"})
+    if resp.ok:
+        return sum(1 for o in resp.json() if o.get("ticker") == TICKER)
+    return 0
+
+
 def place(session, action, price, qty):
     if qty <= 0:
-        return
+        return 0
     session.post(HOST + "/orders", params={"ticker": TICKER, "type": "LIMIT",
                  "quantity": min(qty, ORDER_SIZE), "action": action, "price": round(price, 4)})
+    return 1
 
 
 def market(session, action, qty):
-    # only used for the final safety flatten; chunked to the 5,000 per-order max
     remaining = abs(qty)
     while remaining > 0:
         q = min(5000, remaining)
@@ -133,12 +137,14 @@ def pnl_of(sec):
 def main():
     mid_hist = []
     last_fair = None
+    last_posted = 0
+    last_repost_t = 0.0
     loops = 0
 
     with requests.Session() as s:
         s.headers.update({"X-API-Key": API_KEY})
         get_case(s)  # fail fast on bad key/connection
-        print("Connected. ALGO2 market maker (limit %d, target $%d). Press STOP to halt."
+        print("Connected. ALGO2 MM v2 (limit %d, target $%d). Press STOP to halt."
               % (EFFECTIVE_LIMIT, PROFIT_TARGET))
 
         try:
@@ -146,7 +152,7 @@ def main():
                 loops += 1
                 status, tick, tpp = get_case(s)
                 if status != "ACTIVE":
-                    sleep(0.5)
+                    sleep(0.3)
                     continue
                 sec_left = tpp - tick
 
@@ -179,7 +185,7 @@ def main():
 
                 winding_down = sec_left <= WIND_DOWN_AT_SEC_LEFT
 
-                # ---- dynamic half-spread from recent volatility ----
+                # ---- dynamic half-spread ----
                 if len(mid_hist) >= 3:
                     diffs = [abs(mid_hist[i + 1] - mid_hist[i]) for i in range(len(mid_hist) - 1)]
                     vol_ticks = (sum(diffs) / len(diffs)) / TICK_SIZE
@@ -194,32 +200,36 @@ def main():
                 inv = max(-1.0, min(1.0, pos / float(EFFECTIVE_LIMIT)))
                 fair = anchor - INVENTORY_SKEW * inv * half * TICK_SIZE
 
-                # ---- sticky orders: hold queue priority unless fair moved ----
-                if (last_fair is not None and not winding_down and
-                        abs(fair - last_fair) < REPRICE_THRESHOLD_TICKS * TICK_SIZE):
+                # ---- THE FIX: repost if filled, if fair moved, or on heartbeat ----
+                n_open = get_open_order_count(s)
+                now = monotonic()
+                need_repost = (
+                    last_fair is None
+                    or n_open < last_posted                      # a fill happened
+                    or abs(fair - last_fair) >= REPRICE_THRESHOLD_TICKS * TICK_SIZE
+                    or (now - last_repost_t) >= REFRESH_MAX_SEC   # heartbeat
+                    or winding_down
+                )
+                if not need_repost:
                     sleep(LOOP_PACING)
                     continue
-                last_fair = fair
 
                 cancel_all(s)
 
-                # room to the EFFECTIVE limit on each side (never hit the fine)
                 room_buy = max(0, EFFECTIVE_LIMIT - pos)
                 room_sell = max(0, EFFECTIVE_LIMIT + pos)
-                # wind-down: only quote the side that reduces inventory
-                if winding_down:
+                if winding_down:                     # only reduce inventory late
                     if pos > 0:
                         room_buy = 0
                     elif pos < 0:
                         room_sell = 0
 
+                posted = 0
                 for layer in range(NUM_LAYERS):
                     offset = (half + layer) * TICK_SIZE
                     bid_price = round_tick(fair - offset)
                     ask_price = round_tick(fair + offset)
 
-                    # QUEUE JUMP on the front layer: one tick inside the crowd,
-                    # never crossing and never through fair (stays passive).
                     if QUEUE_JUMP and layer == 0:
                         jb = round_tick(best_bid + TICK_SIZE)
                         ja = round_tick(best_ask - TICK_SIZE)
@@ -230,9 +240,12 @@ def main():
 
                     if bid_price >= ask_price:
                         continue
-                    place(s, "BUY", bid_price, min(ORDER_SIZE, room_buy - layer * ORDER_SIZE))
-                    place(s, "SELL", ask_price, min(ORDER_SIZE, room_sell - layer * ORDER_SIZE))
+                    posted += place(s, "BUY", bid_price, min(ORDER_SIZE, room_buy - layer * ORDER_SIZE))
+                    posted += place(s, "SELL", ask_price, min(ORDER_SIZE, room_sell - layer * ORDER_SIZE))
 
+                last_fair = fair
+                last_posted = posted
+                last_repost_t = now
                 sleep(LOOP_PACING)
 
         except KeyboardInterrupt:
