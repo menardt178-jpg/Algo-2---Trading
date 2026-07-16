@@ -1,31 +1,37 @@
 # -*- coding: utf-8 -*-
 """
-RIT ALGO2 - Algorithmic Market Making - AGGRESSIVE (trading-only)
-=================================================================
-Pure requests + stdlib. Runs directly in Spyder 6. Tuned for a ~300 tick heat
-with a large-size, mean-reversion-assisted market-making strategy.
+RIT ALGO2 - Algorithmic Market Making - OPTIMIZED FOR THE REAL CASE
+===================================================================
+Tuned to the ALGO2 Case Brief (Rotman, Build 1.00). Pure requests + stdlib,
+runs directly in Spyder 6.
 
-RUN
-  1) paste API_KEY
-  2) SET SIZE LIMITS TO YOUR CASE MAX (see the CONFIG note): MAX_POSITION and
-     ORDER_SIZE are the #1 driver of P&L. Push them to whatever the Case Brief
-     allows -- but do not exceed the gross limit or per-order max size or RIT
-     will reject the orders.
-  3) open RIT, load the case, press play (ACTIVE)
-  4) press Run in Spyder. Red Stop cancels orders and flattens.
+CASE FACTS (baked into the config below):
+  * one stock: ALGO,  tick size $0.01,  heat = 300 seconds
+  * 5,000 shares MAX per order
+  * 25,000 shares gross/net position limit
+  * MARKET orders (active) cost 1 cent/share commission
+  * LIMIT orders (passive) that fill EARN a 1/2 cent/share REBATE
+  * FINE of 10 cents/share for EXCEEDING the 25,000 limit  <-- never touch this
 
-MAKING 10k IN 300s -- THE MATH
-  pnl ~= ticks_per_roundtrip * shares * roundtrips
-  e.g. 2 ticks * 5000 shares * ~50 roundtrips = ~$10,000.
-  So you need BIG size and a HIGH fill rate. Everything below serves that:
-    - large ORDER_SIZE across several layers,
-    - MEAN_REVERT anchor => buy dips / sell rips (extra edge in a
-      mean-reverting market, which the data analyzer flagged),
-    - queue jumping for priority fills,
-    - inventory skew so big size doesn't trap you at the position limit.
-  WARNING: big size + mean-revert anchor is dangerous if the market TRENDS.
-  Run analyze_market_data.py first; if it says TRENDING, cut MEAN_REVERT_WEIGHT
-  to ~0.1 and ORDER_SIZE roughly in half.
+WHY THIS BEATS THE TEACHER'S BASE CODE
+  The base algo (case solution) rests one bid at LAST-Spread and one ask at
+  LAST+Spread and just keeps 2 orders alive. Every student runs the same thing,
+  so they all sit at the same stale levels. The edges here:
+    1. REBATE-FIRST: quote passively on BOTH sides every cycle so you harvest
+       the 1/2c rebate on every fill. Two passive fills = +1c/share BEFORE any
+       spread. We NEVER send market orders except the final safety flatten,
+       because a market order turns that +1c into -1c.
+    2. QUEUE JUMP: rest one tick INSIDE the crowd (still passive, still earns
+       the rebate) so your order fills before the students quoting at the top of
+       book. This is the "front-run" -- pure priority, no crossing.
+    3. INVENTORY SKEW + WIND-DOWN: lean quotes against your position and, in the
+       last seconds, only quote the side that REDUCES inventory, so you never
+       ride a trend into the 25,000 fine and you finish near flat.
+    4. SPEED: a Python REST loop reprices far faster than an Excel F9 / RTD loop.
+
+TARGET: ~$10k in 300s. That needs volume: capture ~a few cents + 1c rebate per
+round trip on ~5,000 shares (~$150-250/round trip) about 40-60 times. Achievable
+in an active, range-bound market; hard if it trends (see MEAN_REVERT_WEIGHT).
 """
 
 from time import sleep
@@ -35,39 +41,41 @@ import requests
 API_KEY = "REPLACE_WITH_YOUR_RIT_API_KEY"
 HOST = "http://localhost:9999/v1"
 
-TICKER = "ALGO"                 # <-- confirm in the Case Brief
+TICKER = "ALGO"
 TICK_SIZE = 0.01
 
-# ---- SIZE (the main P&L lever -- set to your case maximums) ----
-ORDER_SIZE = 1000              # shares per layer (must be <= MAX_ORDER_SIZE)
-MAX_ORDER_SIZE = 10000         # per-order max size from the brief (CONFIRM); RIT
-                               # rejects any single order larger than this
-NUM_LAYERS = 3                 # layers per side -> total working = SIZE*LAYERS
-MAX_POSITION = 25000           # gross position limit from the brief (CONFIRM)
-LAYER_STEP_TICKS = 1
+# ---- SIZE (case: 5,000/order, 25,000 position limit) ----
+ORDER_SIZE = 5000              # per layer; case max per order is 5,000
+NUM_LAYERS = 2                 # layers per side
+MAX_POSITION = 25000           # HARD case limit
+POSITION_BUFFER = 2000         # stay this far under the limit -> effective 23,000
+                               # (avoids the 10c/share fine on fill-timing races)
 
 # ---- Quoting ----
-BASE_HALF_SPREAD = 2           # ticks each side of fair value (from analyzer)
-VOL_PER_TICK = 0.02            # typical 1-tick move (from analyzer)
-VOL_WIDEN = 1.5
+BASE_HALF_SPREAD = 2           # ticks each side of fair value
+VOL_WIDEN = 1.5               # extra half-spread ticks per 1 std of recent vol
+VOL_PER_TICK = 0.02            # typical 1-tick move (tune from the Excel data)
 MAX_HALF_SPREAD = 8
-QUEUE_JUMP = True
+QUEUE_JUMP = True              # rest one tick inside the crowd (stays passive)
 
 # ---- Mean-reversion edge (buy dips / sell rips) ----
-MEAN_REVERT_WEIGHT = 0.30      # 0..1 pull of fair value toward the rolling mean
-MEAN_LOOKBACK = 30             # samples for the rolling mean
+MEAN_REVERT_WEIGHT = 0.25      # 0..1; SET TO 0 IF THE MARKET TRENDS
+MEAN_LOOKBACK = 30
 
-# ---- Inventory management ----
+# ---- Inventory management / timing (300s heat) ----
 INVENTORY_SKEW = 0.5           # 0..1 lean quotes against your position
-FLATTEN_AT_TICKS_LEFT = 8
+WIND_DOWN_AT_SEC_LEFT = 30     # last 30s: only quote the inventory-reducing side
+FLATTEN_AT_SEC_LEFT = 8        # last 8s: market-flatten any residual (accept 1c)
 
 # ---- Loop / P&L ----
 REPRICE_THRESHOLD_TICKS = 1
-LOOP_PACING = 0.08             # faster loop = more fills (watch rate limits)
+LOOP_PACING = 0.08
 VOL_LOOKBACK = 20
-PROFIT_TARGET = 10000          # printed progress only
-PNL_PRINT_EVERY = 25           # print P&L every N loops
+PROFIT_TARGET = 10000
+PNL_PRINT_EVERY = 25
 # ==========================================================================
+
+EFFECTIVE_LIMIT = MAX_POSITION - POSITION_BUFFER
 
 
 class ApiException(Exception):
@@ -90,13 +98,20 @@ def get_security(session):
 
 
 def place(session, action, price, qty):
+    if qty <= 0:
+        return
     session.post(HOST + "/orders", params={"ticker": TICKER, "type": "LIMIT",
-                 "quantity": qty, "action": action, "price": round(price, 4)})
+                 "quantity": min(qty, ORDER_SIZE), "action": action, "price": round(price, 4)})
 
 
 def market(session, action, qty):
-    session.post(HOST + "/orders", params={"ticker": TICKER, "type": "MARKET",
-                 "quantity": qty, "action": action})
+    # only used for the final safety flatten; chunked to the 5,000 per-order max
+    remaining = abs(qty)
+    while remaining > 0:
+        q = min(5000, remaining)
+        session.post(HOST + "/orders", params={"ticker": TICKER, "type": "MARKET",
+                     "quantity": q, "action": action})
+        remaining -= q
 
 
 def cancel_all(session):
@@ -108,25 +123,11 @@ def round_tick(price):
 
 
 def pnl_of(sec):
-    """Best-effort P&L from the security payload (fields vary by RIT build)."""
     r = sec.get("realized")
     u = sec.get("unrealized")
     if r is not None or u is not None:
         return (r or 0.0) + (u or 0.0)
     return None
-
-
-def flatten(session, position):
-    if position:
-        cancel_all(session)
-        # split into <= per-order-max chunks so a large flatten isn't rejected
-        step = MAX_ORDER_SIZE
-        side = "SELL" if position > 0 else "BUY"
-        remaining = abs(position)
-        while remaining > 0:
-            q = min(step, remaining)
-            market(session, side, q)
-            remaining -= q
 
 
 def main():
@@ -136,9 +137,9 @@ def main():
 
     with requests.Session() as s:
         s.headers.update({"X-API-Key": API_KEY})
-        get_case(s)  # fail fast if key/connection are wrong
-        print("Connected. AGGRESSIVE market maker on %s (target $%d). Press STOP to halt."
-              % (TICKER, PROFIT_TARGET))
+        get_case(s)  # fail fast on bad key/connection
+        print("Connected. ALGO2 market maker (limit %d, target $%d). Press STOP to halt."
+              % (EFFECTIVE_LIMIT, PROFIT_TARGET))
 
         try:
             while True:
@@ -147,6 +148,7 @@ def main():
                 if status != "ACTIVE":
                     sleep(0.5)
                     continue
+                sec_left = tpp - tick
 
                 sec = get_security(s)
                 pos = sec["position"]
@@ -160,22 +162,24 @@ def main():
                 if len(mid_hist) > max(VOL_LOOKBACK, MEAN_LOOKBACK):
                     mid_hist.pop(0)
 
-                # progress readout
                 if loops % PNL_PRINT_EVERY == 0:
                     p = pnl_of(sec)
-                    msg = "tick %d/%d  pos %+d" % (tick, tpp, pos)
+                    msg = "t-%ds  pos %+d" % (sec_left, pos)
                     if p is not None:
-                        msg += "  P&L $%.0f / %d  (%.0f%%)" % (p, PROFIT_TARGET,
-                                                              100.0 * p / PROFIT_TARGET)
+                        msg += "  P&L $%.0f / %d (%.0f%%)" % (p, PROFIT_TARGET, 100.0 * p / PROFIT_TARGET)
                     print(msg)
 
-                # end-of-period risk unwind
-                if tpp - tick <= FLATTEN_AT_TICKS_LEFT:
-                    flatten(s, pos)
+                # ---- final safety flatten (accept the 1c market cost) ----
+                if sec_left <= FLATTEN_AT_SEC_LEFT:
+                    cancel_all(s)
+                    if pos:
+                        market(s, "SELL" if pos > 0 else "BUY", pos)
                     sleep(LOOP_PACING)
                     continue
 
-                # dynamic half-spread from recent volatility
+                winding_down = sec_left <= WIND_DOWN_AT_SEC_LEFT
+
+                # ---- dynamic half-spread from recent volatility ----
                 if len(mid_hist) >= 3:
                     diffs = [abs(mid_hist[i + 1] - mid_hist[i]) for i in range(len(mid_hist) - 1)]
                     vol_ticks = (sum(diffs) / len(diffs)) / TICK_SIZE
@@ -184,34 +188,38 @@ def main():
                 extra = max(0.0, vol_ticks - VOL_PER_TICK / TICK_SIZE)
                 half = min(MAX_HALF_SPREAD, max(BASE_HALF_SPREAD, BASE_HALF_SPREAD + VOL_WIDEN * extra))
 
-                # mean-reversion anchor: pull fair toward the rolling mean so we
-                # naturally quote to BUY below-average prices and SELL above-average
+                # ---- fair value: mean-revert anchor + inventory skew ----
                 rolling_mean = sum(mid_hist) / len(mid_hist)
                 anchor = mid + MEAN_REVERT_WEIGHT * (rolling_mean - mid)
-
-                # inventory skew on top of the anchor
-                inv = max(-1.0, min(1.0, pos / float(MAX_POSITION)))
+                inv = max(-1.0, min(1.0, pos / float(EFFECTIVE_LIMIT)))
                 fair = anchor - INVENTORY_SKEW * inv * half * TICK_SIZE
 
-                # sticky orders: hold queue priority unless fair really moved
-                if (last_fair is not None and
+                # ---- sticky orders: hold queue priority unless fair moved ----
+                if (last_fair is not None and not winding_down and
                         abs(fair - last_fair) < REPRICE_THRESHOLD_TICKS * TICK_SIZE):
                     sleep(LOOP_PACING)
                     continue
                 last_fair = fair
 
                 cancel_all(s)
-                can_buy = pos < MAX_POSITION
-                can_sell = pos > -MAX_POSITION
-                # taper size as we approach the limit so we never get stuck flat
-                room_buy = max(0, MAX_POSITION - pos)
-                room_sell = max(0, MAX_POSITION + pos)
+
+                # room to the EFFECTIVE limit on each side (never hit the fine)
+                room_buy = max(0, EFFECTIVE_LIMIT - pos)
+                room_sell = max(0, EFFECTIVE_LIMIT + pos)
+                # wind-down: only quote the side that reduces inventory
+                if winding_down:
+                    if pos > 0:
+                        room_buy = 0
+                    elif pos < 0:
+                        room_sell = 0
 
                 for layer in range(NUM_LAYERS):
-                    offset = (half + layer * LAYER_STEP_TICKS) * TICK_SIZE
+                    offset = (half + layer) * TICK_SIZE
                     bid_price = round_tick(fair - offset)
                     ask_price = round_tick(fair + offset)
 
+                    # QUEUE JUMP on the front layer: one tick inside the crowd,
+                    # never crossing and never through fair (stays passive).
                     if QUEUE_JUMP and layer == 0:
                         jb = round_tick(best_bid + TICK_SIZE)
                         ja = round_tick(best_ask - TICK_SIZE)
@@ -222,13 +230,8 @@ def main():
 
                     if bid_price >= ask_price:
                         continue
-
-                    buy_q = min(ORDER_SIZE, room_buy - layer * ORDER_SIZE)
-                    sell_q = min(ORDER_SIZE, room_sell - layer * ORDER_SIZE)
-                    if can_buy and buy_q > 0:
-                        place(s, "BUY", bid_price, buy_q)
-                    if can_sell and sell_q > 0:
-                        place(s, "SELL", ask_price, sell_q)
+                    place(s, "BUY", bid_price, min(ORDER_SIZE, room_buy - layer * ORDER_SIZE))
+                    place(s, "SELL", ask_price, min(ORDER_SIZE, room_sell - layer * ORDER_SIZE))
 
                 sleep(LOOP_PACING)
 
@@ -239,7 +242,9 @@ def main():
         finally:
             try:
                 cancel_all(s)
-                flatten(s, get_security(s)["position"])
+                pos = get_security(s)["position"]
+                if pos:
+                    market(s, "SELL" if pos > 0 else "BUY", pos)
                 print("Done: orders cancelled, position flattened.")
             except Exception as e:
                 print("Cleanup error: %s" % e)
