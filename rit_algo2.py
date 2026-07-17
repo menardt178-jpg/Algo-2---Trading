@@ -1,30 +1,37 @@
 # -*- coding: utf-8 -*-
 """
-RIT ALGO2 - Algorithmic Market Making - OPTIMIZED (v3)
-======================================================
-Reverts to the v1 economics that scored ~8.8k, and fixes the "stops trading
-after ~100s" idle bug WITHOUT destroying spread capture. Pure requests + stdlib,
+RIT ALGO2 - Algorithmic Market Making - COMPETITIVE (v4)
+========================================================
+Built to win fills in a crowded field (20+ students). Pure requests + stdlib,
 runs in Spyder 6.
 
-WHAT WENT WRONG IN v2 (broke even):
-  v2 reposted on every fill with cancel_all, which cancelled the resting exit
-  order (the one about to catch the rebound and lock in the spread) and
-  re-centered both quotes on the dipped price. Result: buy low, sell not-high =
-  spread thrown away, only the thin rebate left. Tighter quoting made it worse.
+WHY v1/v3 (~8.8k) FADED AGAINST 20 STUDENTS
+  They quoted at fair +/- 2 ticks -- BEHIND the touch. With 19 other market
+  makers sitting at the top of book, orders behind the touch rarely fill; you
+  only get hit on adverse moves. The leaderboard winners did 1-1.7M shares by
+  being AT the top of book constantly and harvesting the 0.5c rebate on huge
+  passive volume (their spread capture was only ~0.5c).
 
-THE CORRECT FIX (v3):
-  * Keep v1's wider quoting so each round trip captures real spread + rebate.
-  * When the price MOVES past a threshold: reprice both sides (v1 behaviour).
-  * When the market is CALM (price frozen) and a fill happened: DON'T cancel the
-    resting exit. Only TOP UP the missing side with a fresh order. This keeps you
-    trading through the calm second half while preserving the resting order that
-    captures the spread on the other side.
+WHAT v4 DOES DIFFERENTLY
+  * TOP-OF-BOOK QUOTING: quotes the most aggressive PASSIVE price -- one tick
+    inside the touch (or joins it in a 1-tick book), bounded by fair value so it
+    never buys above / sells below fair, and never crosses (stays passive -> earns
+    the rebate). This wins the queue against students quoting behind the touch.
+  * NON-DESTRUCTIVE TOP-UP (from v3): when calm and a fill happens, it refills
+    only the filled side and keeps the resting exit -- no cancel_all churn (the
+    bug that made v2 break even).
+  * STRONG INVENTORY SKEW: aggressive quoting fills fast, so fair leans harder
+    against the position to keep the book balanced.
+  * FAST LOOP + rebate-first (never take liquidity except the final flatten).
 
 CASE FACTS: ALGO, $0.01 tick, 300s, 5,000/order, 25,000 limit, 1c commission
 (active), 0.5c rebate (passive fills), 10c/share fine over 25,000.
+
+If a path clearly TRENDS, set MEAN_REVERT_WEIGHT=0 and raise INVENTORY_SKEW.
 """
 
-from time import sleep, monotonic
+import math
+from time import sleep
 import requests
 
 # ============================== CONFIG ====================================
@@ -40,28 +47,27 @@ NUM_LAYERS = 2
 MAX_POSITION = 25000
 POSITION_BUFFER = 2000                 # effective 23,000 -> avoids the 10c fine
 
-# ---- Quoting (v1 values that made ~8.8k) ----
-BASE_HALF_SPREAD = 2                    # ticks each side -> real spread capture
-VOL_WIDEN = 1.5
+# ---- Quoting: top-of-book aggressive (the competitive edge) ----
+BASE_HALF_SPREAD = 1                    # 1 = quote at the fair boundary / touch
+VOL_WIDEN = 1.5                        # widen only when volatility actually spikes
 VOL_PER_TICK = 0.02
-MAX_HALF_SPREAD = 8
-QUEUE_JUMP = True
+MAX_HALF_SPREAD = 6
 
-# ---- Mean-reversion (v1 value) ----
+# ---- Mean-reversion ----
 MEAN_REVERT_WEIGHT = 0.25              # SET TO 0 IF A PATH TRENDS
 MEAN_LOOKBACK = 30
 
 # ---- Inventory / timing (300s heat) ----
-INVENTORY_SKEW = 0.5
+INVENTORY_SKEW = 0.6                    # lean harder; aggressive quoting fills fast
 WIND_DOWN_AT_SEC_LEFT = 30
 FLATTEN_AT_SEC_LEFT = 8
 
 # ---- Loop ----
-REPRICE_THRESHOLD_TICKS = 1            # reprice both sides when fair moves this
-LOOP_PACING = 0.08
+REPRICE_THRESHOLD_TICKS = 1
+LOOP_PACING = 0.05                      # fast: react to fills/moves before others
 VOL_LOOKBACK = 20
 PROFIT_TARGET = 10000
-PNL_PRINT_EVERY = 30
+PNL_PRINT_EVERY = 40
 # ==========================================================================
 
 EFFECTIVE_LIMIT = MAX_POSITION - POSITION_BUFFER
@@ -87,7 +93,6 @@ def get_security(session):
 
 
 def get_resting_orders(session):
-    """Return (buy_qtys, sell_qtys) = remaining size of our open orders per side."""
     resp = session.get(HOST + "/orders", params={"status": "OPEN"})
     buys, sells = [], []
     if resp.ok:
@@ -127,16 +132,22 @@ def round_tick(price):
 
 
 def quote_prices(fair, half, best_bid, best_ask, layer):
-    offset = (half + layer) * TICK_SIZE
-    bid = round_tick(fair - offset)
-    ask = round_tick(fair + offset)
-    if QUEUE_JUMP and layer == 0:                 # rest 1 tick inside the crowd
-        jb = round_tick(best_bid + TICK_SIZE)
-        ja = round_tick(best_ask - TICK_SIZE)
-        if bid < jb < fair:
-            bid = jb
-        if fair < ja < ask:
-            ask = ja
+    """Most aggressive PASSIVE quote: one tick inside the touch, bounded by fair,
+    never crossing the book. Deeper layers step further out."""
+    t = TICK_SIZE
+    bid = round_tick(best_bid + t)
+    ask = round_tick(best_ask - t)
+    if bid >= ask:                                  # 1-tick book: join the touch
+        bid, ask = round_tick(best_bid), round_tick(best_ask)
+    highest_bid = round(math.floor(fair / t - 1e-9) * t, 4)   # largest tick < fair
+    lowest_ask = round(math.ceil(fair / t + 1e-9) * t, 4)     # smallest tick > fair
+    extra = (half - 1) * t                                    # volatility widening
+    bid = min(bid, round_tick(highest_bid - extra))
+    ask = max(ask, round_tick(lowest_ask + extra))
+    bid = round_tick(bid - layer * t)
+    ask = round_tick(ask + layer * t)
+    bid = min(bid, round_tick(best_ask - t))        # stay passive: never cross
+    ask = max(ask, round_tick(best_bid + t))
     return bid, ask
 
 
@@ -156,7 +167,7 @@ def main():
     with requests.Session() as s:
         s.headers.update({"X-API-Key": API_KEY})
         get_case(s)  # fail fast on bad key/connection
-        print("Connected. ALGO2 MM v3 (limit %d, target $%d). Press STOP to halt."
+        print("Connected. ALGO2 MM v4 competitive (limit %d, target $%d). Press STOP to halt."
               % (EFFECTIVE_LIMIT, PROFIT_TARGET))
 
         try:
@@ -216,11 +227,11 @@ def main():
                               abs(fair - last_fair) >= REPRICE_THRESHOLD_TICKS * TICK_SIZE)
 
                 if last_fair is None or fair_moved or winding_down:
-                    # ---- FULL REPRICE: market moved (or late) -> re-quote both sides ----
+                    # market moved (or late) -> re-quote both sides at the touch
                     cancel_all(s)
                     room_buy = max(0, EFFECTIVE_LIMIT - pos)
                     room_sell = max(0, EFFECTIVE_LIMIT + pos)
-                    if winding_down:                 # only reduce inventory late
+                    if winding_down:
                         if pos > 0:
                             room_buy = 0
                         elif pos < 0:
@@ -233,25 +244,24 @@ def main():
                         place(s, "SELL", ask_price, min(ORDER_SIZE, room_sell - layer * ORDER_SIZE))
                     last_fair = fair
                 else:
-                    # ---- CALM MARKET: top up ONLY the filled side, keep the ----
-                    # ---- resting exit order so it still captures the spread. ----
+                    # calm: top up ONLY the filled side, keep the resting exit
                     buys, sells = get_resting_orders(s)
                     bid_price, ask_price = quote_prices(fair, half, best_bid, best_ask, 0)
-                    # account for existing resting size so we never breach the limit
                     room_buy = EFFECTIVE_LIMIT - pos - sum(buys)
                     room_sell = EFFECTIVE_LIMIT + pos - sum(sells)
-                    for _ in range(NUM_LAYERS - len(buys)):
-                        q = min(ORDER_SIZE, room_buy)
-                        if q <= 0:
-                            break
-                        place(s, "BUY", bid_price, q)
-                        room_buy -= q
-                    for _ in range(NUM_LAYERS - len(sells)):
-                        q = min(ORDER_SIZE, room_sell)
-                        if q <= 0:
-                            break
-                        place(s, "SELL", ask_price, q)
-                        room_sell -= q
+                    if bid_price < ask_price:
+                        for _ in range(NUM_LAYERS - len(buys)):
+                            q = min(ORDER_SIZE, room_buy)
+                            if q <= 0:
+                                break
+                            place(s, "BUY", bid_price, q)
+                            room_buy -= q
+                        for _ in range(NUM_LAYERS - len(sells)):
+                            q = min(ORDER_SIZE, room_sell)
+                            if q <= 0:
+                                break
+                            place(s, "SELL", ask_price, q)
+                            room_sell -= q
 
                 sleep(LOOP_PACING)
 
